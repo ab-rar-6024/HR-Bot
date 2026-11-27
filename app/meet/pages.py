@@ -313,8 +313,13 @@ ROOM = f"""<!doctype html><html lang="en"><head><title>Interview Room - ProofyX 
 @media(max-width:960px){{.room-grid{{grid-template-columns:1fr}}}}
 .stage{{background:rgba(2,6,23,.85);border-radius:18px;overflow:hidden;border:1px solid var(--bd);position:relative;box-shadow:var(--sh)}}
 video{{width:100%;background:transparent;display:block;aspect-ratio:16/9;object-fit:contain}}
-.cam-box{{border-radius:14px;overflow:hidden;border:1px solid var(--bd);background:rgba(2,6,23,.85);margin-bottom:10px;box-shadow:var(--sh)}}
+.cam-box{{position:relative;border-radius:14px;overflow:hidden;border:1px solid var(--bd);background:rgba(2,6,23,.85);margin-bottom:10px;box-shadow:var(--sh)}}
 .cam-box video{{aspect-ratio:16/10;object-fit:cover}}
+.cam-box canvas{{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}}
+.proctor-alert{{background:rgba(220,38,38,.18);border:2px solid var(--red);border-radius:12px;padding:10px 12px;color:#fecaca;font-weight:700;font-size:13px;margin-bottom:10px;display:none}}
+@media (prefers-color-scheme:light){{.proctor-alert{{color:#991b1b}}}}
+.p-row{{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--bd2);font-size:13px}}
+.p-row:last-child{{border-bottom:0}}
 .lbl{{font-size:12px;font-weight:600;color:var(--mut);margin-bottom:4px;display:flex;justify-content:space-between}}
 .banner{{position:sticky;top:0;z-index:30;padding:10px 16px;background:rgba(220,38,38,.9);backdrop-filter:blur(12px);color:#fff;font-weight:600;text-align:center;display:none;font-size:13.5px}}
 .controls{{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;padding:14px;background:var(--glass);backdrop-filter:blur(22px) saturate(180%);-webkit-backdrop-filter:blur(22px) saturate(180%);border:1px solid var(--bd);border-radius:16px;margin-top:14px;box-shadow:var(--sh)}}
@@ -394,11 +399,18 @@ ul.consent li{{margin:8px 0}}
    </div>
    <div>
     <div id="remoteCamWrap" hidden>
-     <div class="lbl"><span>Candidate Camera</span></div>
-     <div class="cam-box"><video id="cam" autoplay playsinline></video></div>
+     <div class="lbl"><span>Candidate Camera</span><span class="mut" id="proctorSt">AI loading...</span></div>
+     <div id="deviceAlert" class="proctor-alert" role="alert"></div>
+     <div class="cam-box"><video id="cam" autoplay playsinline></video><canvas id="camOverlay"></canvas></div>
+    </div>
+    <div id="proctorCard" class="card" style="padding:12px 14px;margin-bottom:10px" hidden>
+     <div style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--mut);margin-bottom:6px">Live Proctoring &amp; Accuracy</div>
+     <div class="p-row"><span>Eye Tracking</span><span id="pEye" class="pill">--</span></div>
+     <div class="p-row"><span>Voice Activity</span><span id="pVoice" class="pill">--</span></div>
+     <div class="p-row"><span>External Display / Mobile</span><span id="pDev" class="pill g">Clear</span></div>
     </div>
     <div class="lbl"><span>You (Local Preview)</span></div>
-    <div class="cam-box"><video id="self" autoplay playsinline muted style="transform:scaleX(-1)"></video></div>
+    <div class="cam-box"><video id="self" autoplay playsinline muted style="transform:scaleX(-1)"></video><canvas id="selfOverlay" style="transform:scaleX(-1)"></canvas></div>
     <div class="card" style="padding:14px;margin-bottom:0">
      <h2 style="font-size:14px;margin-bottom:8px">Live Chat &amp; Activity</h2>
      <div id="log" class="feed"></div>
@@ -440,7 +452,7 @@ function fail(m){{$('err').textContent=m;setSt('stopped','r')}}
   $('who').textContent=info.other;$('consent').hidden=false;setSt('waiting for consent','a');
  }}
  else{{
-  $('room').hidden=false;$('mainlbl').textContent="Candidate's Screen";$('remoteCamWrap').hidden=false;
+  $('room').hidden=false;$('mainlbl').textContent="Candidate's Screen";$('remoteCamWrap').hidden=false;$('proctorCard').hidden=false;
   $('mlBtn').hidden=false;$('permBtn').hidden=false;
   try{{const evs=await api('/api/meetings/'+mid+'/events');evs.slice(-15).forEach(e=>addFeed(e.name+(e.detail?' ('+e.detail+')':''),'msg-sys',e.created_utc))}}catch(e){{}}
   await start();
@@ -590,14 +602,138 @@ async function offer(){{
 async function answer(m){{
  newPc();
  pc.ontrack=e=>{{const s=e.streams[0];if(!s)return;
-  if(s.id===m.screenStreamId){{$('main').srcObject=s}}else{{$('cam').srcObject=s}}}};
+  if(s.id===m.screenStreamId){{$('main').srcObject=s}}else{{$('cam').srcObject=s;startVoiceMonitor(s);startProctorLoop($('cam'),$('camOverlay'),true)}}}};
  await pc.setRemoteDescription(m.sdp);
  local.cam.getTracks().forEach(t=>pc.addTrack(t,local.cam));
  const a=await pc.createAnswer();await pc.setLocalDescription(a);
  ws.send(JSON.stringify({{type:'answer',sdp:pc.localDescription}}))
 }}
 
-function leave(){{leaving=true;try{{ws&&ws.send(JSON.stringify({{type:'bye'}}))}}catch(e){{}}
+function loadScript(src){{return new Promise((res,rej)=>{{const s=document.createElement('script');s.src=src;s.onload=res;s.onerror=rej;document.head.appendChild(s)}})}}
+
+let cocoModel=null,faceLM=null,proctorReady=false,lastAlertAt=0;
+async function ensureProctorAI(){{
+ if(proctorReady)return true;
+ proctorReady=true;
+ try{{
+  if($('proctorSt'))$('proctorSt').textContent='Loading AI models...';
+  await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js');
+  await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js');
+  cocoModel=await cocoSsd.load({{base:'lite_mobilenet_v2'}});
+  try{{
+   const mp=await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs');
+   const fs=await mp.FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+   faceLM=await mp.FaceLandmarker.createFromOptions(fs,{{
+    baseOptions:{{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',delegate:'GPU'}},
+    runningMode:'VIDEO',numFaces:2,outputFaceBlendshapes:true
+   }});
+  }}catch(e){{console.warn('FaceLandmarker fallback:',e)}}
+  if($('proctorSt'))$('proctorSt').textContent='AI Active';
+  return true;
+ }}catch(e){{
+  if($('proctorSt'))$('proctorSt').textContent='AI offline';
+  return false;
+ }}
+}}
+
+function startVoiceMonitor(stream){{
+ try{{
+  const AC=window.AudioContext||window.webkitAudioContext;
+  if(!AC||!stream.getAudioTracks().length)return;
+  const ctx=new AC(),src=ctx.createMediaStreamSource(stream),an=ctx.createAnalyser();
+  an.fftSize=512;src.connect(an);
+  const data=new Uint8Array(an.frequencyBinCount),sr=ctx.sampleRate;
+  setInterval(()=>{{
+   if(leaving)return;
+   an.getByteFrequencyData(data);
+   let voiceE=0,totalE=0;
+   for(let i=0;i<data.length;i++){{
+    const hz=i*sr/an.fftSize,v=data[i];totalE+=v;
+    if(hz>=300&&hz<=3400)voiceE+=v;
+   }}
+   const avg=totalE/data.length,ratio=totalE>0?Math.round((voiceE/totalE)*100):0;
+   if($('pVoice')){{
+    if(avg<6){{$('pVoice').textContent='Silent (0%)';$('pVoice').className='pill'}}
+    else if(ratio>=45){{$('pVoice').textContent=`${{ratio}}% · User Voice`;$('pVoice').className='pill g'}}
+    else{{$('pVoice').textContent=`${{ratio}}% · Background Noise`;$('pVoice').className='pill a'}}
+   }}
+  }},500);
+ }}catch(e){{}}
+}}
+
+let proctorTimer=null;
+async function startProctorLoop(vid,cvs,isHr){{
+ await ensureProctorAI();
+ if(proctorTimer)clearInterval(proctorTimer);
+ proctorTimer=setInterval(async()=>{{
+  if(leaving||!vid.videoWidth||!vid.videoHeight)return;
+  if(cvs.width!==vid.videoWidth){{cvs.width=vid.videoWidth;cvs.height=vid.videoHeight}}
+  const ctx=cvs.getContext('2d');ctx.clearRect(0,0,cvs.width,cvs.height);
+
+  // 1. External Display / Mobile Phone detection -> RED box + accuracy %
+  let devFound=null,persons=0;
+  if(cocoModel){{
+   try{{
+    const preds=await cocoModel.detect(vid);
+    for(const p of preds){{
+     if(p.class==='person'&&p.score>=0.45)persons++;
+     if((p.class==='cell phone'||p.class==='tv'||p.class==='remote')&&p.score>=0.38){{
+      const acc=Math.round(p.score*100);
+      const [x,y,w,h]=p.bbox;
+      ctx.strokeStyle='#ef4444';ctx.lineWidth=3;ctx.strokeRect(x,y,w,h);
+      const lbl=`${{p.class.toUpperCase()}} · ${{acc}}%`;
+      ctx.font='bold 13px system-ui,sans-serif';
+      const tw=ctx.measureText(lbl).width+12;
+      ctx.fillStyle='rgba(220,38,38,0.92)';ctx.fillRect(x,Math.max(0,y-22),tw,22);
+      ctx.fillStyle='#fff';ctx.fillText(lbl,x+6,Math.max(15,y-6));
+      if(!devFound||acc>devFound.acc)devFound={{cls:p.class,acc}};
+     }}
+    }}
+   }}catch(e){{}}
+  }}
+  if($('pDev')){{
+   if(devFound){{
+    $('pDev').textContent=`${{devFound.cls}} (${{devFound.acc}}%)`;$('pDev').className='pill r';
+    if($('deviceAlert')){{$('deviceAlert').style.display='block';$('deviceAlert').textContent=`⚠ External device detected: ${{devFound.cls}} (${{devFound.acc}}% accuracy)`}}
+    if(isHr&&Date.now()-lastAlertAt>8000){{
+     lastAlertAt=Date.now();
+     addFeed(`External device (${{devFound.cls}}) detected · ${{devFound.acc}}%`,'msg-alert');
+     api('/api/meetings/'+mid+'/proctor-event',{{method:'POST',body:{{name:'device_detected',detail:`${{devFound.cls}} (${{devFound.acc}}%)`}}}}).catch(()=>{{}});
+    }}
+   }}else if(persons>1){{
+    $('pDev').textContent=`${{persons}} people in frame`;$('pDev').className='pill r';
+    if($('deviceAlert')){{$('deviceAlert').style.display='block';$('deviceAlert').textContent=`⚠ Multiple people detected (${{persons}})`}}
+   }}else{{
+    $('pDev').textContent='Clear (0%)';$('pDev').className='pill g';
+    if($('deviceAlert'))$('deviceAlert').style.display='none';
+   }}
+  }}
+
+  // 2. Eye Tracking & Gaze Focus Accuracy %
+  if(faceLM){{
+   try{{
+    const res=faceLM.detectForVideo(vid,performance.now());
+    if(res.faceLandmarks&&res.faceLandmarks.length){{
+     const lm=res.faceLandmarks[0];
+     ctx.fillStyle='#22d3ee';
+     [468,473].forEach(idx=>{{if(lm[idx]){{ctx.beginPath();ctx.arc(lm[idx].x*cvs.width,lm[idx].y*cvs.height,3.5,0,Math.PI*2);ctx.fill()}}}});
+     const bs=(res.faceBlendshapes&&res.faceBlendshapes[0]&&res.faceBlendshapes[0].categories)||[];
+     const g=n=>(bs.find(c=>c.categoryName===n)||{{score:0}}).score;
+     const away=Math.max(g('eyeLookOutLeft'),g('eyeLookInLeft'),g('eyeLookOutRight'),g('eyeLookInRight'),g('eyeLookDownLeft'),g('eyeLookDownRight'));
+     const focus=Math.round(Math.max(0,Math.min(100,100-away*115)));
+     if($('pEye')){{
+      $('pEye').textContent=focus>=60?`${{focus}}% · Focused`:`${{focus}}% · Looking away`;
+      $('pEye').className='pill '+(focus>=60?'g':focus>=35?'a':'r');
+     }}
+    }}else if($('pEye')){{
+     $('pEye').textContent='0% · No face';$('pEye').className='pill r';
+    }}
+   }}catch(e){{}}
+  }}
+ }},750);
+}}
+
+function leave(){{leaving=true;if(proctorTimer)clearInterval(proctorTimer);try{{ws&&ws.send(JSON.stringify({{type:'bye'}}))}}catch(e){{}}
  [local.cam,screenStream].forEach(s=>s&&s.getTracks().forEach(t=>t.stop()));if(pc)pc.close();if(ws)ws.close();
  location=info&&info.role==='hr'?'/hr':'/my'}}
 window.addEventListener('beforeunload',()=>{{[local.cam,screenStream].forEach(s=>s&&s.getTracks().forEach(t=>t.stop()))}});

@@ -372,6 +372,18 @@ def verify_snapshot(mid: str, file: UploadFile = File(...), hr=Depends(auth.requ
             "model_scores": scores, "fake_prob": fake_prob, "ela_score": round(ela_score, 4)}
 
 
+class ProctorEventIn(BaseModel):
+    name: str = Field(min_length=1, max_length=40)
+    detail: str = Field("", max_length=200)
+
+
+@router.post("/api/meetings/{mid}/proctor-event")
+def proctor_event(mid: str, body: ProctorEventIn, hr=Depends(auth.require_hr)):
+    _meeting_for(mid, hr)
+    log_event(mid, hr["id"], body.name, body.detail)
+    return {"ok": True}
+
+
 @router.get("/api/meet/search")
 def in_app_search(q: str, u=Depends(auth.current_user)):
     q = q.strip()[:200]

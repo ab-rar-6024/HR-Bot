@@ -172,6 +172,7 @@ HR = f"""<!doctype html><html lang="en"><head><title>HR Dashboard - ProofyX Veri
 <div class="nav"><div class="nav-in">
  <div class="brand"><span class="brand-dot"></span> ProofyX VerifyOps <span class="pill b">HR</span></div>
  <div class="nav-links">
+  <a class="nav-link" href="/verify">ML Gate</a>
   <a class="nav-link" href="/review">Review Queue</a>
   <a class="nav-link" href="/docs" target="_blank">API Docs</a>
   <span class="mut" id="meName"></span>
@@ -375,7 +376,20 @@ ul.consent li{{margin:8px 0}}
      <button id="micBtn" class="sec">Mic: On</button>
      <button id="camBtn" class="sec">Camera: On</button>
      <button id="shareBtn" class="sec" hidden>Re-share Entire Screen</button>
+     <button id="mlBtn" class="sec" hidden>Check Face (ML)</button>
+     <button id="permBtn" class="sec" hidden>Search: Locked</button>
      <button class="red" onclick="leave()">End Call</button>
+    </div>
+    <div id="searchCard" class="card" style="margin-top:14px;padding:16px" hidden>
+     <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:8px">
+      <h2 style="margin:0;font-size:15px">In-App Web Search</h2>
+      <span id="searchLockPill" class="pill a">Locked by interviewer</span>
+     </div>
+     <form id="searchForm" class="chat-row" style="margin-top:0">
+      <input id="searchIn" placeholder="Ask interviewer for search permission first..." disabled maxlength="200">
+      <button id="searchGo" class="sm" type="submit" disabled>Search</button>
+     </form>
+     <div id="searchRes" style="margin-top:10px;max-height:260px;overflow-y:auto;display:flex;flex-direction:column;gap:8px"></div>
     </div>
    </div>
    <div>
@@ -400,7 +414,7 @@ ul.consent li{{margin:8px 0}}
 
 <script>{JS_COMMON}
 const mid=location.pathname.split('/').pop();
-let info,ws,pc,local={{}},screenStream=null,leaving=false,micOn=true,camOn=true;
+let info,ws,pc,local={{}},screenStream=null,leaving=false,micOn=true,camOn=true,searchAllowed=false;
 const setSt=(t,c)=>{{$('st').textContent=t;$('st').className='pill '+(c||'')}};
 function addFeed(txt,cls='msg-sys',ts=null){{
   const d=document.createElement('div');d.className=cls;
@@ -427,6 +441,7 @@ function fail(m){{$('err').textContent=m;setSt('stopped','r')}}
  }}
  else{{
   $('room').hidden=false;$('mainlbl').textContent="Candidate's Screen";$('remoteCamWrap').hidden=false;
+  $('mlBtn').hidden=false;$('permBtn').hidden=false;
   try{{const evs=await api('/api/meetings/'+mid+'/events');evs.slice(-15).forEach(e=>addFeed(e.name+(e.detail?' ('+e.detail+')':''),'msg-sys',e.created_utc))}}catch(e){{}}
   await start();
  }}
@@ -455,6 +470,37 @@ $('chatForm').addEventListener('submit',ev=>{{
   ev.preventDefault();const v=$('chatIn').value.trim();if(!v||!ws||ws.readyState!==1)return;
   ws.send(JSON.stringify({{type:'chat',text:v}}));
   addFeed('You: '+v,'msg-chat');$('chatIn').value='';
+}});
+$('permBtn').addEventListener('click',()=>{{
+  if(!ws||ws.readyState!==1)return;
+  searchAllowed=!searchAllowed;
+  ws.send(JSON.stringify({{type:'permission',allow_search:searchAllowed}}));
+  $('permBtn').textContent=searchAllowed?'Search: Allowed':'Search: Locked';
+  $('permBtn').className=searchAllowed?'':'sec';
+  addFeed(searchAllowed?'You unlocked in-app search for candidate':'You locked in-app search for candidate','msg-sys');
+}});
+$('mlBtn').addEventListener('click',async()=>{{
+  const v=$('cam');if(!v||!v.videoWidth){{addFeed('Candidate camera not ready yet','msg-alert');return}}
+  $('mlBtn').disabled=true;
+  try{{
+   const cv=document.createElement('canvas');cv.width=v.videoWidth;cv.height=v.videoHeight;
+   cv.getContext('2d').drawImage(v,0,0);
+   const blob=await new Promise(res=>cv.toBlob(res,'image/jpeg',0.9));
+   const fd=new FormData();fd.set('file',blob,'snapshot.jpg');
+   const r=await fetch('/api/meetings/'+mid+'/verify-snapshot',{{method:'POST',credentials:'same-origin',body:fd}});
+   const d=await r.json();if(!r.ok)throw new Error(d.detail||('HTTP '+r.status));
+   const pct=d.fake_prob!==null?Math.round(d.fake_prob*1000)/10:null;
+   const msg=pct!==null?`Face ML: ${{pct}}% fake (${{pct>=50?'SUSPICIOUS':'authentic'}}) · ELA ${{d.ela_score}}`:'No ML model loaded';
+   addFeed(msg,pct!==null&&pct>=50?'msg-alert':'msg-sys');
+  }}catch(e){{addFeed('ML check failed: '+e.message,'msg-alert')}}finally{{$('mlBtn').disabled=false}}
+}});
+$('searchForm').addEventListener('submit',async ev=>{{
+  ev.preventDefault();const q=$('searchIn').value.trim();if(!q||!searchAllowed)return;
+  $('searchGo').disabled=true;$('searchRes').innerHTML='<div class="mut">Searching...</div>';
+  try{{
+   const d=await api('/api/meet/search?q='+encodeURIComponent(q));
+   $('searchRes').innerHTML=(d.results||[]).length?d.results.map(x=>`<div class="msg-chat"><div style="font-weight:600">${{esc(x.title)}}</div><div class="mut" style="font-size:11.5px;word-break:break-all">${{esc(x.url)}}</div><div style="margin-top:3px">${{esc(x.snippet)}}</div></div>`).join(''):'<div class="mut">No results found.</div>';
+  }}catch(e){{$('searchRes').innerHTML='<div class="err">'+esc(e.message)+'</div>'}}finally{{$('searchGo').disabled=!searchAllowed}}
 }});
 
 async function acquireScreen(){{
@@ -485,7 +531,11 @@ function sendEvent(name,detail){{if(ws&&ws.readyState===1)ws.send(JSON.stringify
 async function start(){{
  $('err').textContent='';$('join').disabled=true;
  try{{await getMedia()}}catch(e){{$('err').textContent=e.message;$('join').disabled=false;return}}
- if(info.role==='candidate'){{$('consent').hidden=true;$('room').hidden=false;$('mainlbl').textContent=info.other;$('banner').style.display='block';$('shareBtn').hidden=false}}
+ if(info.role==='candidate'){{
+  $('consent').hidden=true;$('room').hidden=false;$('mainlbl').textContent=info.other;
+  $('banner').style.display='block';$('shareBtn').hidden=false;$('searchCard').hidden=false;
+  document.addEventListener('visibilitychange',()=>{{if(!leaving)sendEvent(document.hidden?'tab_left':'tab_returned')}});
+ }}
  connect()
 }}
 
@@ -506,9 +556,17 @@ function connect(){{
   else if(m.type==='answer'&&pc)await pc.setRemoteDescription(m.sdp);
   else if(m.type==='ice'&&pc&&m.candidate)try{{await pc.addIceCandidate(m.candidate)}}catch(e){{}}
   else if(m.type==='chat'){{addFeed(m.sender+': '+m.text,'msg-chat',m.at)}}
+  else if(m.type==='permission'&&info.role==='candidate'){{
+   searchAllowed=!!m.allow_search;
+   $('searchIn').disabled=!searchAllowed;$('searchGo').disabled=!searchAllowed;
+   $('searchIn').placeholder=searchAllowed?'Search web inside this interview room...':'Ask interviewer for search permission first...';
+   $('searchLockPill').textContent=searchAllowed?'Allowed by interviewer':'Locked by interviewer';
+   $('searchLockPill').className='pill '+(searchAllowed?'g':'a');
+   addFeed(searchAllowed?'Interviewer enabled in-app search':'Interviewer locked in-app search','msg-sys');
+  }}
   else if(m.type==='event'&&info.role==='hr'){{
-   const map={{consent_given:'Candidate gave consent',screen_started:'Screen sharing started',screen_stopped:'Screen sharing STOPPED',screen_not_entire:'Candidate tried to share a window/tab, not the entire screen',camera_stopped:'Camera stopped'}};
-   addFeed(map[m.name]||m.name,m.name==='screen_stopped'||m.name==='screen_not_entire'?'msg-alert':'msg-sys',m.at);
+   const map={{consent_given:'Candidate gave consent',screen_started:'Screen sharing started',screen_stopped:'Screen sharing STOPPED',screen_not_entire:'Candidate tried to share a window/tab, not the entire screen',camera_stopped:'Camera stopped',tab_left:'Candidate switched away from interview tab!',tab_returned:'Candidate returned to interview tab'}};
+   addFeed(map[m.name]||m.name,(m.name==='screen_stopped'||m.name==='screen_not_entire'||m.name==='tab_left')?'msg-alert':'msg-sys',m.at);
   }}
  }};
 }}

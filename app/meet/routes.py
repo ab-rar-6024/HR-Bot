@@ -7,11 +7,12 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, EmailStr, Field
 
 from ..db import connect
+from ..gate import model as gate_model
 from . import auth, pages
 
 log = logging.getLogger("verifyops.meet")
@@ -319,9 +320,14 @@ async def ws_meet(ws: WebSocket, mid: str):
                         "role": role,
                         "at": now().isoformat(),
                     })
+            elif t == "permission" and role == "hr":
+                allow = bool(msg.get("allow_search", False))
+                log_event(mid, u["id"], "search_allowed" if allow else "search_locked")
+                if "candidate" in room:
+                    await room["candidate"].send_json({"type": "permission", "allow_search": allow})
             elif t == "event" and role == "candidate":
                 name = str(msg.get("name", ""))[:40]
-                if name in {"consent_given", "screen_started", "screen_stopped", "screen_not_entire", "camera_stopped"}:
+                if name in {"consent_given", "screen_started", "screen_stopped", "screen_not_entire", "camera_stopped", "tab_left", "tab_returned"}:
                     log_event(mid, u["id"], name, str(msg.get("detail", "")))
                     if "hr" in room:
                         await room["hr"].send_json({"type": "event", "name": name, "detail": msg.get("detail", ""),
@@ -347,3 +353,56 @@ def events(mid: str, hr=Depends(auth.require_hr)):
     with connect() as c:
         rows = c.execute("SELECT name, detail, created_utc FROM meeting_events WHERE meeting_id=? ORDER BY created_utc", (mid,)).fetchall()
     return [dict(r) for r in rows]
+
+
+@router.post("/api/meetings/{mid}/verify-snapshot")
+def verify_snapshot(mid: str, file: UploadFile = File(...), hr=Depends(auth.require_hr)):
+    _meeting_for(mid, hr)
+    data = file.file.read(5 * 1024 * 1024)
+    if not data:
+        raise HTTPException(400, "Empty snapshot")
+    scores = gate_model.detector.predict(data, "face")
+    if not scores:
+        scores = gate_model.detector.predict(data, "auto")
+    ela_score, _ = gate_model.ela(data)
+    fake_prob = max(scores.values()) if scores else None
+    detail = f"fake={round(fake_prob * 100, 1)}% ela={round(ela_score, 3)}" if fake_prob is not None else "no_model"
+    log_event(mid, hr["id"], "face_check", detail)
+    return {"ml_loaded": gate_model.detector.available, "models": gate_model.detector.loaded(),
+            "model_scores": scores, "fake_prob": fake_prob, "ela_score": round(ela_score, 4)}
+
+
+@router.get("/api/meet/search")
+def in_app_search(q: str, u=Depends(auth.current_user)):
+    q = q.strip()[:200]
+    if not q:
+        return {"query": q, "results": []}
+    import html as html_mod
+    import re
+    import urllib.parse
+    import httpx
+    try:
+        r = httpx.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": q},
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            timeout=10,
+            follow_redirects=True,
+        )
+        body = r.text
+    except Exception as e:
+        raise HTTPException(502, f"Search unavailable: {e}")
+    results = []
+    links = re.findall(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', body, re.S)
+    snips = re.findall(r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>', body, re.S)
+    strip_tags = lambda s: html_mod.unescape(re.sub(r"<[^>]+>", "", s)).strip()
+    for i, (href, title) in enumerate(links[:8]):
+        if "uddg=" in href:
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+            href = qs.get("uddg", [href])[0]
+        results.append({
+            "title": strip_tags(title),
+            "url": href,
+            "snippet": strip_tags(snips[i]) if i < len(snips) else "",
+        })
+    return {"query": q, "results": results}

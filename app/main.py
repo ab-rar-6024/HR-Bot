@@ -22,6 +22,7 @@ from .db import connect, dumps, init_db
 from .evidence import vault
 from .fieldproof import exif_check, pdf_audit, phash
 from .gate import model, verdict
+from .meet.pages import STYLE as GLASS_STYLE
 from .meet.routes import router as meet_router
 from .review.ui import PAGE
 
@@ -273,7 +274,93 @@ def verify_chain():
     return {"certificates_checked": len(rows), "intact": not problems, "problems": problems}
 
 
+VERIFY_PAGE = f"""<!doctype html><html lang="en"><head><title>Verification Gate - ProofyX VerifyOps</title>{GLASS_STYLE}</head><body>
+<div class="nav"><div class="nav-in">
+ <div class="brand"><span class="brand-dot"></span> ProofyX VerifyOps <span class="pill b">ML Gate</span></div>
+ <div class="nav-links">
+  <a class="nav-link" href="/hr">HR Dashboard</a>
+  <a class="nav-link" href="/review">Review Queue</a>
+  <a class="nav-link" href="/docs" target="_blank">API Docs</a>
+ </div>
+</div></div>
+<div class="wrap" style="max-width:920px">
+ <div style="margin-bottom:16px"><h1>AI &amp; Forensic Verification Gate</h1><p class="mut">Run the loaded ONNX models (face, scene, document) + FieldProof checks on any photo or PDF.</p></div>
+ <div class="card">
+  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:12px">
+   <h2 style="margin:0">Loaded ML Models</h2>
+   <div id="models" class="mut">Checking /health...</div>
+  </div>
+  <form id="vf">
+   <div class="row">
+    <div><label for="ak">API Key</label><input id="ak" type="password" value="dev-key" required></div>
+    <div><label for="it">Detection Mode</label><select id="it"><option value="auto">Auto (Scene + Face if detected)</option><option value="face">Face Deepfake Model</option><option value="photo">Scene / AI Image Model</option><option value="document">Document Tamper Model</option></select></div>
+   </div>
+   <div class="row">
+    <div><label for="f">File (JPEG, PNG, WEBP, BMP, PDF)</label><input id="f" type="file" accept="image/*,.pdf" required></div>
+    <div><label for="eid">Entity ID (optional)</label><input id="eid" placeholder="CAND-101 or INV-42"></div>
+   </div>
+   <p id="ve" class="err" role="alert"></p>
+   <button id="vb" style="margin-top:12px">Run Verification</button>
+  </form>
+ </div>
+ <div id="res" class="card" hidden>
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+   <h2 style="margin:0">Result</h2>
+   <span id="vAction" class="pill"></span>
+   <span id="vScore" class="pill b"></span>
+  </div>
+  <div class="row">
+   <div>
+    <div class="mut" style="margin-bottom:6px">Model Scores (P(fake))</div>
+    <pre id="vModels" style="background:var(--glass2);padding:10px;border-radius:10px;border:1px solid var(--bd);overflow:auto;margin:0"></pre>
+    <div class="mut" style="margin:12px 0 6px">Forensic Flags</div>
+    <div id="vFlags"></div>
+   </div>
+   <div>
+    <div class="mut" style="margin-bottom:6px">Forensic Heatmap</div>
+    <img id="vHeat" style="max-width:100%;border-radius:12px;border:1px solid var(--bd)" hidden>
+    <div id="vNoHeat" class="mut" hidden>No image heatmap for this file.</div>
+   </div>
+  </div>
+ </div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+(async()=>{{
+ try{{const h=await fetch('/health').then(r=>r.json());
+  $('models').innerHTML=h.models.length?h.models.map(m=>`<span class="pill g" style="margin-left:6px">${{m}}.onnx</span>`).join(''):'<span class="pill r">No ONNX models loaded</span>';
+ }}catch(e){{$('models').textContent='Failed to load /health'}}
+}})();
+$('vf').addEventListener('submit',async ev=>{{
+ ev.preventDefault();$('ve').textContent='';$('vb').disabled=true;$('res').hidden=true;
+ try{{
+  const fd=new FormData();fd.set('file',$('f').files[0]);fd.set('image_type',$('it').value);
+  if($('eid').value)fd.set('entity_id',$('eid').value);
+  const r=await fetch('/api/v1/verify',{{method:'POST',headers:{{'X-API-Key':$('ak').value}},body:fd}});
+  const d=await r.json();
+  if(!r.ok)throw new Error(d.detail||('HTTP '+r.status));
+  $('res').hidden=false;
+  const act=d.recommended_action||'';
+  $('vAction').textContent=act;$('vAction').className='pill '+(act==='PASS'?'g':act==='BLOCK'?'r':'a');
+  $('vScore').textContent='Trust Score: '+d.trust_score+' ('+d.confidence_band+')';
+  const ms=(d.analysis&&d.analysis.model_scores)||{{}};
+  $('vModels').textContent=Object.keys(ms).length?JSON.stringify(ms,null,2):'No applicable ML model ran';
+  $('vFlags').innerHTML=(d.forensic_flags||[]).length?d.forensic_flags.map(x=>`<div style="margin-bottom:6px"><span class="pill ${{x.severity==='high'?'r':'a'}}">${{x.code}}</span> <span class="mut">${{x.detail}}</span></div>`).join(''):'<span class="mut">No forensic flags triggered</span>';
+  if(d.gradcam_heatmap_url){{
+   const hr=await fetch(d.gradcam_heatmap_url,{{headers:{{'X-API-Key':$('ak').value}}}});
+   if(hr.ok){{$('vHeat').src=URL.createObjectURL(await hr.blob());$('vHeat').hidden=false;$('vNoHeat').hidden=true}}
+  }}else{{$('vHeat').hidden=true;$('vNoHeat').hidden=false}}
+ }}catch(e){{$('ve').textContent=e.message}}finally{{$('vb').disabled=false}}
+}});
+</script></body></html>"""
+
+
 # ---------- Review queue ----------
+@app.get("/verify", response_class=HTMLResponse)
+def verify_page():
+    return VERIFY_PAGE
+
+
 @app.get("/review", response_class=HTMLResponse)
 def review_page():
     return PAGE

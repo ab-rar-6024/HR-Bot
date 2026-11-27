@@ -193,10 +193,9 @@ def create_meeting(body: MeetingIn, request: Request, hr=Depends(auth.require_hr
         cid = auth.create_user(body.candidate_email, body.candidate_name, "candidate", temp_pw, must_change=True)
     else:
         cid = cand["id"]
-        if cand["must_change"]:
-            temp_pw = secrets.token_urlsafe(9)
-            with connect() as c:
-                c.execute("UPDATE users SET pw_hash=? WHERE id=?", (auth.hash_pw(temp_pw), cid))
+        temp_pw = secrets.token_urlsafe(9)
+        with connect() as c:
+            c.execute("UPDATE users SET pw_hash=?, must_change=1 WHERE id=?", (auth.hash_pw(temp_pw), cid))
     mid = secrets.token_urlsafe(9)
     with connect() as c:
         c.execute("INSERT INTO meetings VALUES (?,?,?,?,?,?,?,0)",

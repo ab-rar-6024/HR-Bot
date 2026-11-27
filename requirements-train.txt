@@ -1,0 +1,9 @@
+# Training + ONNX export (Colab already has torch; this is for a local venv)
+-r requirements.txt
+torch>=2.2
+torchvision>=0.17
+transformers>=4.40
+datasets>=2.19
+huggingface_hub>=0.23
+onnx>=1.16
+onnxscript>=0.1

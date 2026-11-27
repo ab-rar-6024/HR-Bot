@@ -1,0 +1,10 @@
+data/
+.env
+__pycache__/
+*.pyc
+models/*.onnx
+.venv/
+*.pth
+*.ckpt
+trained/
+.pytest_cache/
